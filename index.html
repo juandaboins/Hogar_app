@@ -213,7 +213,7 @@ let expandedEvent = null;
 let calMonth = new Date().getMonth();
 let calYear = new Date().getFullYear();
 let calSelectedDate = new Date().toISOString().slice(0,10);
-let market = { usd: null, crypto: [], updatedAt: 0, loading: false, error: false };
+let market = { loc: null, usd: null, fx: null, crypto: [], updatedAt: 0, loading: false, error: false };
 const MARKET_REFRESH_MS = 30 * 60 * 1000; // 30 minutos
 
 /* ---------- Almacenamiento portable ---------- */
@@ -351,23 +351,52 @@ function render(){
 
 function setTab(t){ tab = t; render(); if(t === 'ahorro') ensureMarketData(); }
 
-/* ---------- Cotizaciones (dólar y cripto) ---------- */
+/* ---------- Cotizaciones (según ubicación real del usuario + cripto) ---------- */
+function countryFlagEmoji(code){
+  if(!code || code.length !== 2) return '';
+  return String.fromCodePoint(...[...code.toUpperCase()].map(c => 127397 + c.charCodeAt(0)));
+}
 async function ensureMarketData(force){
   const stale = (Date.now() - market.updatedAt) > MARKET_REFRESH_MS;
   if(market.loading || (!force && !stale && market.updatedAt > 0)) return;
   market.loading = true; market.error = false; render();
   try{
-    const [usdRes, cryptoRes] = await Promise.all([
-      fetch('https://dolarapi.com/v1/dolares/blue').then(r=>r.ok?r.json():null).catch(()=>null),
+    // 1) Detectar país real del usuario por IP (no asumir Argentina)
+    const locRes = await fetch('https://ipwho.is/').then(r=>r.ok?r.json():null).catch(()=>null);
+    if(locRes && locRes.success !== false){
+      market.loc = {
+        countryCode: locRes.country_code,
+        countryName: locRes.country,
+        currencyCode: (locRes.currency && locRes.currency.code) || null
+      };
+    } else {
+      market.loc = null;
+    }
+    const isAR = market.loc && market.loc.countryCode === 'AR';
+    const ccy = market.loc && market.loc.currencyCode;
+
+    // 2) Pedir la cotización correcta según dónde esté el usuario
+    let fxPromise = Promise.resolve(null);
+    if(isAR){
+      fxPromise = fetch('https://dolarapi.com/v1/dolares/blue').then(r=>r.ok?r.json():null).catch(()=>null);
+    } else if(ccy && ccy !== 'USD'){
+      fxPromise = fetch(`https://api.frankfurter.app/latest?from=USD&to=${ccy}`).then(r=>r.ok?r.json():null).catch(()=>null);
+    }
+
+    const [fxRes, cryptoRes] = await Promise.all([
+      fxPromise,
       fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=false&price_change_percentage=24h')
         .then(r=>r.ok?r.json():null).catch(()=>null)
     ]);
-    if(usdRes) market.usd = usdRes;
+
+    if(isAR){ market.usd = fxRes; market.fx = null; }
+    else { market.fx = fxRes; market.usd = null; }
+
     if(cryptoRes && Array.isArray(cryptoRes)){
       const stablecoins = ['usdt','usdc','dai','busd','tusd','fdusd'];
       market.crypto = cryptoRes.filter(c=>!stablecoins.includes(c.symbol)).slice(0,3);
     }
-    market.error = !usdRes && !(cryptoRes && cryptoRes.length);
+    market.error = !market.loc && !(cryptoRes && cryptoRes.length);
     market.updatedAt = Date.now();
   }catch(e){
     market.error = true;
@@ -1252,15 +1281,35 @@ function renderAhorro(){
 }
 
 function renderMarketSection(){
-  const usdHtml = market.usd
-    ? `<div class="market-row">
-        <div class="market-name">💵 Dólar blue</div>
-        <div class="market-price">
-          <div class="p">Compra ${fmt(market.usd.compra)}</div>
-          <div class="p" style="font-weight:500;">Venta ${fmt(market.usd.venta)}</div>
-        </div>
-      </div>`
-    : `<div class="market-row"><div class="empty" style="padding:10px 0;">${market.loading ? 'Cargando dólar...' : 'No se pudo cargar el dólar.'}</div></div>`;
+  const loc = market.loc;
+  let fxHtml;
+  if(market.loading && !loc){
+    fxHtml = `<div class="market-row"><div class="empty" style="padding:10px 0;">Detectando tu ubicación...</div></div>`;
+  } else if(loc && loc.countryCode === 'AR'){
+    fxHtml = market.usd
+      ? `<div class="market-row">
+          <div class="market-name">💵 Dólar blue (Argentina)</div>
+          <div class="market-price">
+            <div class="p">Compra ${fmt(market.usd.compra)}</div>
+            <div class="p" style="font-weight:500;">Venta ${fmt(market.usd.venta)}</div>
+          </div>
+        </div>`
+      : `<div class="market-row"><div class="empty" style="padding:10px 0;">${market.loading ? 'Cargando dólar...' : 'No se pudo cargar el dólar.'}</div></div>`;
+  } else if(loc && loc.currencyCode && loc.currencyCode !== 'USD'){
+    const rate = market.fx && market.fx.rates && market.fx.rates[loc.currencyCode];
+    fxHtml = rate
+      ? `<div class="market-row">
+          <div class="market-name">💱 Dólar en ${loc.countryName}</div>
+          <div class="market-price">
+            <div class="p">1 USD = ${rate.toLocaleString('es-AR',{maximumFractionDigits:2})} ${loc.currencyCode}</div>
+          </div>
+        </div>`
+      : `<div class="market-row"><div class="empty" style="padding:10px 0;">${market.loading ? 'Cargando cotización...' : 'No hay cotización disponible para tu moneda ('+loc.currencyCode+').'}</div></div>`;
+  } else if(loc && loc.currencyCode === 'USD'){
+    fxHtml = `<div class="market-row"><div class="empty" style="padding:10px 0;">📍 En ${loc.countryName} tu moneda ya es el dólar estadounidense.</div></div>`;
+  } else {
+    fxHtml = `<div class="market-row"><div class="empty" style="padding:10px 0;">No pudimos detectar tu ubicación para mostrar la cotización local.</div></div>`;
+  }
 
   const cryptoHtml = market.crypto.length
     ? market.crypto.map(c=>{
@@ -1279,13 +1328,17 @@ function renderMarketSection(){
   const updatedLabel = market.updatedAt
     ? 'Actualizado ' + new Date(market.updatedAt).toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'})
     : (market.loading ? 'Actualizando...' : '');
+  const locLabel = loc ? `${countryFlagEmoji(loc.countryCode)} ${loc.countryName}` : '';
 
   return `
-    <div class="market-updated">
-      ${market.error ? '<span style="color:var(--danger)">No se pudo conectar</span>' : `<span>${updatedLabel}</span>`}
-      <button class="market-refresh" onclick="refreshMarket()">↻ Actualizar</button>
+    <div class="market-updated" style="justify-content:space-between;">
+      <span>${locLabel}</span>
+      <span style="display:flex; align-items:center; gap:10px;">
+        ${market.error ? '<span style="color:var(--danger)">No se pudo conectar</span>' : `<span>${updatedLabel}</span>`}
+        <button class="market-refresh" onclick="refreshMarket()">↻ Actualizar</button>
+      </span>
     </div>
-    <div class="market-card">${usdHtml}</div>
+    <div class="market-card">${fxHtml}</div>
     <div class="market-card">${cryptoHtml}</div>
   `;
 }
